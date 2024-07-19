@@ -8,6 +8,10 @@ fn main() {
   }
 
   let data = std::fs::read(&args[1]).expect("Error reading file");
+  // for byte in &data {
+  //   println!("{:08b}", byte);
+  // }
+
   let instructions = decode::disassemble(&data);
   println!("; src: `{}`\n{instructions}", &args[1]);
 }
