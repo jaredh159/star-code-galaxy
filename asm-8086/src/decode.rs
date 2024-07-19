@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 pub fn disassemble(bytes: &[u8]) -> String {
   let mut lines = vec!["bits 16".to_string()];
   let mut index = 0;
@@ -17,9 +19,46 @@ fn disassemble_one(bytes: &[u8]) -> (String, usize) {
     disassemble_mov_reg_mem_to_reg(bytes)
   } else if byte >> 4 == 0b_1011 {
     disassemble_mov_immediate_to_reg(bytes)
+  } else if byte >> 1 == 0b_1100011 {
+    disassemble_immediate_to_reg_mem(bytes)
+  } else if byte >> 2 == 0b_101000 {
+    disassemble_mem_to_acc(bytes)
   } else {
     todo!("unhandled opcode {:08b}", byte)
   }
+}
+
+fn disassemble_mem_to_acc(bytes: &[u8]) -> (String, usize) {
+  assert!(bytes.len() >= 2);
+  let wide = bytes[0] & 0b_0000_0001 == 1;
+  let reverse = bytes[0] & 0b_0000_0010 == 0b_10;
+  match (wide, reverse) {
+    (true, false) => (format!("mov ax, [{}]", to_i16(&bytes[1..])), 3),
+    (false, false) => (format!("mov ax, [{}]", bytes[1] as i8), 2),
+    (true, true) => (format!("mov [{}], ax", to_i16(&bytes[1..])), 3),
+    (false, true) => (format!("mov [{}], ax", bytes[1] as i8), 2),
+  }
+}
+
+fn disassemble_immediate_to_reg_mem(bytes: &[u8]) -> (String, usize) {
+  assert!(bytes.len() >= 2);
+  let byte1 = bytes[0];
+  let byte2 = bytes[1];
+  let rm = byte2 & 0b_0000_0111;
+  let wide = byte1 & 0b_0000_0001 == 1;
+  let r#mod = byte2 >> 6;
+  let (disp, disp_size) = match r#mod {
+    0b_00 => ("".to_string(), 0),
+    0b_01 => (add_disp_i8(bytes[2]), 1),
+    0b_10 => (add_disp_i16(&bytes[2..]), 2),
+    _ => unreachable!(),
+  };
+  let dst = effective_address(rm, disp);
+  let (src, data_size) = match wide {
+    false => (format!("byte {}", bytes[2]), 1),
+    true => (format!("word {}", to_i16(&bytes[4..])), 2),
+  };
+  (format!("mov {dst}, {src}"), 2 + disp_size + data_size)
 }
 
 fn disassemble_mov_immediate_to_reg(bytes: &[u8]) -> (String, usize) {
@@ -43,60 +82,23 @@ fn disassemble_mov_reg_mem_to_reg(bytes: &[u8]) -> (String, usize) {
   let r#mod = b2 >> 6;
   let rm = b2 & 0b_0000_0111;
   let reg = (b2 >> 3) & 0b0000_0111;
-  // println!("\nbyte: {:08b}", b1);
-  // print!("mod: {:02b}, ", r#mod);
-  // print!("r/m: {:03b}, ", rm);
-  // print!("dbit: {d_bit_set}, ");
-  // println!("reg: {:03b}", reg);
   match r#mod {
     // memory mode (no displacement)
     0b_00 if rm != 0b_110 => {
       let dst = register(reg, w_bit_set);
-      let src = match rm {
-        0b_000 => "[bx + si]",
-        0b_001 => "[bx + di]",
-        0b_010 => "[bp + si]",
-        0b_011 => "[bp + di]",
-        0b_100 => "[si]",
-        0b_101 => "[di]",
-        0b_110 => "[???]", // todo...
-        0b_111 => "[bx]",
-        _ => unreachable!(),
-      };
-      (format!("mov {}", operands(dst, src, d_bit_set)), 2)
+      let src = effective_address(rm, "".to_string());
+      (format!("mov {}", operands(dst, &src, d_bit_set)), 2)
     }
     // memory mode (8-bit displacement)
     0b_01 => {
       let dst = register(reg, w_bit_set);
-      let add_disp = add_disp_i8(bytes[2]);
-      let src = match rm {
-        0b_000 => format!("[bx + si{}]", add_disp),
-        0b_001 => format!("[bx + di{}]", add_disp),
-        0b_010 => format!("[bp + si{}]", add_disp),
-        0b_011 => format!("[bp + di{}]", add_disp),
-        0b_100 => format!("[si{}]", add_disp),
-        0b_101 => format!("[di{}]", add_disp),
-        0b_110 => format!("[bp{}]", add_disp),
-        0b_111 => format!("[bx{}]", add_disp),
-        _ => unreachable!(),
-      };
+      let src = effective_address(rm, add_disp_i8(bytes[2]));
       (format!("mov {}", operands(dst, &src, d_bit_set)), 3)
     }
     // memory mode (16-bit displacement)
     0b_10 => {
       let dst = register(reg, w_bit_set);
-      let add_disp = add_disp_i16(&bytes[2..]);
-      let src = match rm {
-        0b_000 => format!("[bx + si{}]", add_disp),
-        0b_001 => format!("[bx + di{}]", add_disp),
-        0b_010 => format!("[bp + si{}]", add_disp),
-        0b_011 => format!("[bp + di{}]", add_disp),
-        0b_100 => format!("[si{}]", add_disp),
-        0b_101 => format!("[di{}]", add_disp),
-        0b_110 => format!("[bp{}]", add_disp),
-        0b_111 => format!("[bx{}]", add_disp),
-        _ => unreachable!(),
-      };
+      let src = effective_address(rm, add_disp_i16(&bytes[2..]));
       (format!("mov {}", operands(dst, &src, d_bit_set)), 4)
     }
     // register mode (no displacement)
@@ -104,6 +106,12 @@ fn disassemble_mov_reg_mem_to_reg(bytes: &[u8]) -> (String, usize) {
       let dst = register(rm, w_bit_set);
       let src = register(reg, w_bit_set);
       (format!("mov {dst}, {src}"), 2)
+    }
+    // direct address
+    0b_00 if rm == 0b_110 => {
+      let dst = register(reg, w_bit_set);
+      let src = format!("[{}]", to_i16(&bytes[2..]));
+      (format!("mov {dst}, {src}"), 4)
     }
     _ => todo!("unhandled mov mode"),
   }
@@ -131,6 +139,20 @@ fn register(reg: u8, w_bit_set: bool) -> &'static str {
   }
 }
 
+fn effective_address(rm: u8, addend: String) -> String {
+  match rm {
+    0b_000 => format!("[bx + si{}]", addend),
+    0b_001 => format!("[bx + di{}]", addend),
+    0b_010 => format!("[bp + si{}]", addend),
+    0b_011 => format!("[bp + di{}]", addend),
+    0b_100 => format!("[si{}]", addend),
+    0b_101 => format!("[di{}]", addend),
+    0b_110 => format!("[bp{}]", addend),
+    0b_111 => format!("[bx{}]", addend),
+    _ => unreachable!(),
+  }
+}
+
 fn operands<S: AsRef<str>>(src: S, dest: S, d_bit_set: bool) -> String {
   if d_bit_set {
     format!("{}, {}", src.as_ref(), dest.as_ref())
@@ -146,19 +168,20 @@ fn to_i16(bytes: &[u8]) -> i16 {
 }
 
 fn add_disp_i8(byte: u8) -> String {
-  if byte == 0 {
-    "".to_string()
-  } else {
-    format!(" + {}", byte as i8)
+  let byte = byte as i8;
+  match byte.cmp(&0) {
+    Ordering::Equal => "".to_string(),
+    Ordering::Less => format!(" - {}", -byte),
+    Ordering::Greater => format!(" + {}", byte),
   }
 }
 
 fn add_disp_i16(bytes: &[u8]) -> String {
-  let wide = to_i16(bytes);
-  if wide == 0 {
-    "".to_string()
-  } else {
-    format!(" + {}", wide)
+  let word = to_i16(bytes);
+  match word.cmp(&0) {
+    Ordering::Equal => "".to_string(),
+    Ordering::Less => format!(" - {}", -word),
+    Ordering::Greater => format!(" + {}", word),
   }
 }
 
@@ -294,6 +317,72 @@ mod tests {
         mov [bx + di], cx
         mov [bp + si], cl
         mov [bp], ch
+      "}
+    );
+  }
+
+  #[test]
+  fn test_listing_40() {
+    assert_eq!(
+      disassemble(&[
+        // signed displacements
+        0b_10001011,
+        0b_01000001,
+        0b_11011011,
+        0b_10001001,
+        0b_10001100,
+        0b_11010100,
+        0b_11111110,
+        0b_10001011,
+        0b_01010111,
+        0b_11100000,
+        // explicit sizes
+        0b_11000110,
+        0b_00000011,
+        0b_00000111,
+        // 901/347
+        0b_11000111,
+        0b_10000101,
+        0b_10000101,
+        0b_00000011,
+        0b_01011011,
+        0b_00000001,
+        0b_10001011,
+        // direct address
+        0b_00101110,
+        0b_00000101,
+        0b_00000000,
+        0b_10001011,
+        0b_00011110,
+        0b_10000010,
+        0b_00001101,
+        0b_10100001,
+        // memory to accumulator
+        0b_11111011,
+        0b_00001001,
+        0b_10100001,
+        0b_00010000,
+        0b_00000000,
+        0b_10100011,
+        0b_11111010,
+        0b_00001001,
+        0b_10100011,
+        0b_00001111,
+        0b_00000000,
+      ]),
+      asm! {"
+        bits 16
+        mov ax, [bx + di - 37]
+        mov [si - 300], cx
+        mov dx, [bx - 32]
+        mov [bp + di], byte 7
+        mov [di + 901], word 347
+        mov bp, [5]
+        mov bx, [3458]
+        mov ax, [2555]
+        mov ax, [16]
+        mov [2554], ax
+        mov [15], ax
       "}
     );
   }
